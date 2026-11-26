@@ -1,0 +1,130 @@
+import { chromium } from 'playwright';
+import assert from 'node:assert/strict';
+import { readFile, writeFile } from 'node:fs/promises';
+
+const report = { cases: [], errors: [], networkRequests: [], screenshots: [] };
+const browser = await chromium.launch({ headless: true, args: ['--no-sandbox', '--disable-dev-shm-usage', '--use-gl=angle', '--use-angle=swiftshader', '--enable-unsafe-swiftshader'] });
+const context = await browser.newContext({ viewport: { width: 1365, height: 1000 }, deviceScaleFactor: 1, acceptDownloads: true });
+const page = await context.newPage();
+page.on('pageerror', error => report.errors.push(error.message));
+page.on('console', message => { if (message.type() === 'error') report.errors.push(message.text()); });
+page.on('request', request => { if (/^https?:/.test(request.url())) report.networkRequests.push(request.url()); });
+const url = 'file:///sdcard/Download/DSH-Go/%E7%B2%BE%E7%81%B5%E7%90%83-3D%E4%BA%92%E5%8A%A8.html';
+const state = () => page.evaluate(() => window.pokeLab.getState());
+const waitState = (fn, timeout = 15000) => page.waitForFunction(fn, null, { timeout });
+try {
+  await page.goto(url, { waitUntil: 'load', timeout: 60000 });
+  await page.waitForFunction(() => {
+    const loader = document.querySelector('#loader');
+    if (window.pokeLab && loader?.classList.contains('hidden')) return true;
+    if (loader?.classList.contains('error')) {
+      throw new Error(`3D 初始化失败: ${loader.textContent?.trim() || '未知错误'}`);
+    }
+    return false;
+  }, null, { timeout: 60000 });
+  assert.equal((await state()).targetOpen, 0);
+  report.cases.push('Offline desktop rendering initializes without external resources');
+  await page.screenshot({ path: '/root/workspace/pokeball-studio/desktop-closed.png', fullPage: true, timeout: 60000 });
+  report.screenshots.push('desktop-closed.png');
+  await page.locator('#open').click();
+  await waitState(() => window.pokeLab.getState().open > 0.98);
+  assert.equal(await page.locator('#open').getAttribute('aria-pressed'), 'true');
+  assert((await state()).hingeAngle < -1.75);
+  await page.screenshot({ path: '/root/workspace/pokeball-studio/desktop-open.png', fullPage: true, timeout: 60000 });
+  report.screenshots.push('desktop-open.png');
+  report.cases.push('Open control rotates the real lid hinge and updates accessible state');
+  await page.locator('#close').click();
+  await waitState(() => window.pokeLab.getState().open < 0.02);
+  report.cases.push('Close control returns lid to closed position');
+  const buttonPosition = await page.evaluate(() => window.pokeLab.buttonPosition());
+  await page.mouse.click(buttonPosition.x, buttonPosition.y);
+  await waitState(() => window.pokeLab.getState().targetOpen === 1);
+  report.cases.push('Raycast on actual front button toggles lid');
+  await page.locator('#viewport').focus();
+  await page.keyboard.press('Space');
+  await waitState(() => window.pokeLab.getState().targetOpen === 0);
+  report.cases.push('Space shortcut toggles open and close');
+  const beforeDrag = await state();
+  const viewport = await page.locator('#viewport').boundingBox();
+  await page.mouse.move(viewport.x + viewport.width * 0.6, viewport.y + viewport.height * 0.45);
+  await page.mouse.down();
+  await page.mouse.move(viewport.x + viewport.width * 0.6 + 80, viewport.y + viewport.height * 0.45 + 25, { steps: 8 });
+  await page.mouse.up();
+  assert((await state()).userY > beforeDrag.userY + 0.2);
+  report.cases.push('Dragging rotates model without triggering open');
+  await page.locator('#zoom-in').click();
+  assert((await state()).zoom > 1);
+  await page.locator('#reset').click();
+  assert.equal((await state()).zoom, 1);
+  report.cases.push('Zoom and reset restore canonical camera state');
+  await page.locator('#capture').click();
+  await waitState(() => window.pokeLab.getState().sequence === 'capture');
+  await waitState(() => window.pokeLab.getState().sequence === null, 25000);
+  assert.equal((await state()).targetOpen, 0);
+  assert.equal(await page.locator('#capture').isDisabled(), false);
+  assert.equal(await page.locator('#release').isDisabled(), false);
+  assert.match(await page.locator('#activity-label').textContent(), /捕获成功/);
+  assert.equal(await page.locator('#flash').evaluate(element => Number(getComputedStyle(element).opacity)), 0);
+  report.cases.push('Throw/capture sequence completes, restores controls, closes lid and clears flash');
+  await page.locator('#release').click();
+  await waitState(() => window.pokeLab.getState().sequence === null, 25000);
+  assert.equal((await state()).targetOpen, 1);
+  assert.equal(await page.locator('#open').getAttribute('aria-pressed'), 'true');
+  report.cases.push('Release sequence completes and open button agrees with actual lid');
+  await page.locator('#capture').click();
+  await page.locator('#open').click();
+  assert.equal((await state()).sequence, null);
+  assert.equal(await page.locator('#capture').isDisabled(), false);
+  report.cases.push('Manual control interrupts actions cleanly');
+  await page.locator('#auto-rotate').click();
+  assert.equal((await state()).autoRotate, true);
+  await page.locator('#reset').click();
+  assert.equal((await state()).autoRotate, false);
+  report.cases.push('Auto rotation can be enabled and reset');
+  await page.locator('#help').click();
+  assert.equal(await page.locator('#help').getAttribute('aria-expanded'), 'true');
+  await page.keyboard.press('Escape');
+  assert.equal(await page.locator('#help').getAttribute('aria-expanded'), 'false');
+  report.cases.push('Help opens and closes accessibly');
+  const downloadPromise = page.waitForEvent('download');
+  await page.locator('#export').click();
+  const download = await downloadPromise;
+  const downloaded = await readFile(await download.path());
+  assert.equal(downloaded.readUInt32LE(0), 0x46546c67);
+  assert.equal(downloaded.readUInt32LE(4), 2);
+  assert.equal(downloaded.length, downloaded.readUInt32LE(8));
+  const source = await readFile('/sdcard/Download/DSH-Go/Pokeball.glb');
+  assert.deepEqual(downloaded, source);
+  report.cases.push('Embedded GLB download matches validated model byte for byte');
+
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.locator('#reset').click();
+  await page.locator('#close').click();
+  await waitState(() => window.pokeLab.getState().open < 0.02);
+  assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
+  await page.evaluate(() => scrollTo(0, 0));
+  await page.screenshot({ path: '/root/workspace/pokeball-studio/mobile-closed.png', fullPage: true, timeout: 60000 });
+  report.screenshots.push('mobile-closed.png');
+  await page.locator('#open').click();
+  await waitState(() => window.pokeLab.getState().open > 0.98);
+  await page.evaluate(() => scrollTo(0, 0));
+  await page.screenshot({ path: '/root/workspace/pokeball-studio/mobile-open.png', fullPage: true, timeout: 60000 });
+  report.screenshots.push('mobile-open.png');
+  report.cases.push('390px phone layout has no horizontal overflow, open/close controls work');
+  for (const width of [320, 700, 768, 1024]) {
+    await page.setViewportSize({ width, height: 900 });
+    assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), `Overflow at width ${width}`);
+  }
+  report.cases.push('No horizontal overflow at 320, 700, 768 or 1024px');
+  assert.equal(report.errors.length, 0);
+  assert.equal(report.networkRequests.length, 0);
+  report.result = 'passed';
+} catch (error) {
+  report.result = 'failed'; report.failure = error.stack;
+  try { await page.screenshot({ path: '/root/workspace/pokeball-studio/check-failure.png', fullPage: true, timeout: 60000 }); } catch {}
+  process.exitCode = 1;
+} finally {
+  await writeFile('/root/workspace/pokeball-studio/verification.json', JSON.stringify(report, null, 2));
+  console.log(JSON.stringify(report, null, 2));
+  await browser.close();
+}
